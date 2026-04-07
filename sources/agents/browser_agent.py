@@ -20,6 +20,9 @@ class Action(Enum):
     SEARCH = "SEARCH"
     
 class BrowserAgent(Agent):
+    MAX_NAVIGATION_RETRIES = 3
+    NAVIGATION_RETRY_DELAY = 2
+    
     def __init__(self, name, prompt_path, provider, verbose=False, browser=None):
         """
         The Browser agent is an agent that navigate the web autonomously in search of answer
@@ -39,9 +42,63 @@ class BrowserAgent(Agent):
         self.date = self.get_today_date()
         self.logger = Logger("browser_agent.log")
         self.memory = Memory(self.load_prompt(prompt_path),
-                        recover_last_session=False, # session recovery in handled by the interaction class
+                        recover_last_session=False,
                         memory_compression=False,
                         model_provider=provider.get_model_name())
+        self.navigation_errors = 0
+        self.last_navigation_error = None
+        self.debug_mode = verbose
+        
+    def _debug_log(self, message: str):
+        """Log debug messages when verbose mode is enabled."""
+        if self.debug_mode:
+            self.logger.info(f"[DEBUG] {message}")
+        self.logger.info(message)
+
+    def _retry_navigation(self, link: str) -> bool:
+        """Execute navigation with retry logic."""
+        self._debug_log(f"Attempting navigation to {link} with retries")
+        
+        for attempt in range(self.MAX_NAVIGATION_RETRIES):
+            try:
+                self._debug_log(f"Navigation attempt {attempt + 1}/{self.MAX_NAVIGATION_RETRIES}")
+                
+                if self.browser is None:
+                    self.logger.error("Browser not initialized")
+                    return False
+                    
+                nav_ok = self.browser.go_to(link)
+                
+                if nav_ok:
+                    self.navigation_errors = 0
+                    self.last_navigation_error = None
+                    self._debug_log(f"Successfully navigated to {link}")
+                    return True
+                else:
+                    error_msg = self.browser.last_error if hasattr(self.browser, 'last_error') else "Unknown"
+                    self.logger.warning(f"Navigation failed (attempt {attempt + 1}): {error_msg}")
+                    self.navigation_errors += 1
+                    self.last_navigation_error = error_msg
+                    
+            except Exception as e:
+                self.logger.warning(f"Navigation exception (attempt {attempt + 1}): {str(e)}")
+                self.navigation_errors += 1
+                self.last_navigation_error = str(e)
+            
+            if attempt < self.MAX_NAVIGATION_RETRIES - 1:
+                wait_time = self.NAVIGATION_RETRY_DELAY * (attempt + 1)
+                self._debug_log(f"Waiting {wait_time}s before retry")
+                time.sleep(wait_time)
+        
+        self.logger.error(f"Failed to navigate to {link} after {self.MAX_NAVIGATION_RETRIES} attempts")
+        return False
+
+    def _should_retry(self) -> bool:
+        """Check if navigation should be retried based on error history."""
+        if self.navigation_errors >= self.MAX_NAVIGATION_RETRIES:
+            self.logger.warning(f"Max navigation errors reached ({self.navigation_errors})")
+            return False
+        return True
     
     def get_today_date(self) -> str:
         """Get the date"""
@@ -324,7 +381,7 @@ class BrowserAgent(Agent):
         """
         return prompt
     
-    async def process(self, user_prompt: str, speech_module: type) -> Tuple[str, str]:
+    async def process(self, user_prompt: str, speech_module: type = None) -> Tuple[str, str]:
         """
         Process the user prompt to conduct an autonomous web search.
         Start with a google search with searxng using web_search tool.
@@ -337,29 +394,44 @@ class BrowserAgent(Agent):
         """
         complete = False
 
+        self._debug_log(f"Starting browser agent process with prompt: {user_prompt[:100]}...")
+        
         animate_thinking(f"Thinking...", color="status")
         mem_begin_idx = self.memory.push('user', self.search_prompt(user_prompt))
         ai_prompt, reasoning = await self.llm_request()
+        
         if Action.REQUEST_EXIT.value in ai_prompt:
             pretty_print(f"Web agent requested exit.\n{reasoning}\n\n{ai_prompt}", color="failure")
             return ai_prompt, "" 
+        
         animate_thinking(f"Searching...", color="status")
         self.status_message = "Searching..."
+        self._debug_log("Executing web search")
+        
         search_result_raw = self.tools["web_search"].execute([ai_prompt], False)
         search_result = self.jsonify_search_results(search_result_raw)[:16]
+        self._debug_log(f"Got {len(search_result)} search results")
         self.show_search_results(search_result)
+        
         prompt = self.make_newsearch_prompt(user_prompt, search_result)
         unvisited = [None]
+        
         while not complete and len(unvisited) > 0 and not self.stop:
             self.memory.clear()
             unvisited = self.select_unvisited(search_result)
+            self._debug_log(f"Processing with {len(unvisited)} unvisited results")
+            
             answer, reasoning = await self.llm_decide(prompt, show_reasoning = False)
+            
             if self.stop:
                 pretty_print(f"Requested stop.", color="failure")
                 break
+            
             if self.last_answer == answer:
+                self._debug_log("Detected stuck - same answer as before")
                 prompt = self.stuck_prompt(user_prompt, unvisited)
                 continue
+            
             self.last_answer = answer
             pretty_print('▂'*32, color="status")
 
@@ -367,6 +439,7 @@ class BrowserAgent(Agent):
             if len(extracted_form) > 0:
                 self.status_message = "Filling web form..."
                 pretty_print(f"Filling inputs form...", color="status")
+                self._debug_log(f"Filling form with {len(extracted_form)} inputs")
                 fill_success = self.browser.fill_form(extracted_form)
                 page_text = self.get_page_text(limit_to_model_ctx=True)
                 answer = self.handle_update_prompt(user_prompt, page_text, fill_success)
@@ -381,8 +454,10 @@ class BrowserAgent(Agent):
 
             links = self.parse_answer(answer)
             link = self.select_link(links)
+            
             if link == self.current_page:
                 pretty_print(f"Already visited {link}. Search callback.", color="status")
+                self._debug_log(f"Already visited {link}, going back to search results")
                 prompt = self.make_newsearch_prompt(user_prompt, unvisited)
                 self.search_history.append(link)
                 continue
@@ -395,6 +470,7 @@ class BrowserAgent(Agent):
 
             if (link == None and len(extracted_form) < 3) or Action.GO_BACK.value in answer or link in self.search_history:
                 pretty_print(f"Going back to results. Still {len(unvisited)}", color="status")
+                self._debug_log(f"Going back, link={link}, extracted_form={len(extracted_form)}, in_history={link in self.search_history if link else 'N/A'}")
                 self.status_message = "Going back to search results..."
                 prompt = self.make_newsearch_prompt(user_prompt, unvisited)
                 self.search_history.append(link)
@@ -402,14 +478,22 @@ class BrowserAgent(Agent):
                 continue
 
             animate_thinking(f"Navigating to {link}", color="status")
-            if speech_module: speech_module.speak(f"Navigating to {link}")
-            nav_ok = self.browser.go_to(link)
+            if speech_module: 
+                speech_module.speak(f"Navigating to {link}")
+            
+            self._debug_log(f"Attempting navigation to {link}")
+            nav_ok = self._retry_navigation(link)
+            
             self.search_history.append(link)
+            
             if not nav_ok:
-                pretty_print(f"Failed to navigate to {link}.", color="failure")
+                self._debug_log(f"Navigation failed, last error: {self.last_navigation_error}")
+                pretty_print(f"Failed to navigate to {link}. Retrying with new search.", color="failure")
                 prompt = self.make_newsearch_prompt(user_prompt, unvisited)
                 continue
+                
             self.current_page = link
+            self._debug_log(f"Navigation successful, extracting page text")
             page_text = self.get_page_text(limit_to_model_ctx=True)
             self.navigable_links = self.browser.get_navigable()
             prompt = self.make_navigation_prompt(user_prompt, page_text)

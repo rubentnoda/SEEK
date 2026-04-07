@@ -187,16 +187,25 @@ def create_driver(headless=False, stealth_mode=True, crx_path="./crx/nopecha.crx
     return webdriver.Chrome(service=service, options=chrome_options)
 
 class Browser:
-    def __init__(self, driver, anticaptcha_manual_install=False):
+    DEFAULT_TIMEOUT = 30
+    PAGE_LOAD_TIMEOUT = 30
+    ELEMENT_TIMEOUT = 10
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
+
+    def __init__(self, driver, anticaptcha_manual_install=False, page_timeout=None):
         """Initialize the browser with optional AntiCaptcha installation."""
         self.js_scripts_folder = "./sources/web_scripts/" if not __name__ == "__main__" else "./web_scripts/"
         self.anticaptcha = "https://chrome.google.com/webstore/detail/nopecha-captcha-solver/dknlfmjaanfblgfdfebhijalfmhmjjjo/related"
         self.logger = Logger("browser.log")
         self.screenshot_folder = os.path.join(os.getcwd(), ".screenshots")
         self.tabs = []
+        self.page_timeout = page_timeout or self.PAGE_LOAD_TIMEOUT
+        self.navigation_retries = 0
+        self.last_error = None
         try:
             self.driver = driver
-            self.wait = WebDriverWait(self.driver, 10)
+            self.wait = WebDriverWait(self.driver, self.ELEMENT_TIMEOUT)
         except Exception as e:
             raise Exception(f"Failed to initialize browser: {str(e)}")
         self.setup_tabs()
@@ -246,37 +255,109 @@ class Browser:
         script = self.load_js("spoofing.js")
         self.driver.execute_script(script)
     
-    def go_to(self, url:str) -> bool:
-        """Navigate to a specified URL."""
-        time.sleep(random.uniform(0.4, 2.5))
-        try:
-            initial_handles = self.driver.window_handles
-            self.driver.get(url)
-            time.sleep(random.uniform(0.01, 0.3))
+    def _retry_operation(self, operation, max_retries=None, *args, **kwargs):
+        """Execute an operation with retry logic for transient failures."""
+        max_retries = max_retries or self.MAX_RETRIES
+        last_exception = None
+        
+        for attempt in range(max_retries):
             try:
-                wait = WebDriverWait(self.driver, timeout=10)
-                wait.until(
-                    lambda driver: (
-                        not any(keyword in driver.page_source.lower() for keyword in ["checking your browser", "captcha"])
-                    ),
-                    message="stuck on 'checking browser' or verification screen"
-                )
-            except TimeoutException:
-                self.logger.warning("Timeout while waiting for page to bypass 'checking your browser'")
-            self.apply_web_safety()
-            time.sleep(random.uniform(0.01, 0.2))
-            self.human_scroll()
-            self.logger.log(f"Navigated to: {url}")
-            return True
-        except TimeoutException as e:
-            self.logger.error(f"Timeout waiting for {url} to load: {str(e)}")
-            return False
-        except WebDriverException as e:
-            self.logger.error(f"Error navigating to {url}: {str(e)}")
-            return False
-        except Exception as e:
-            self.logger.error(f"Fatal error with go_to method on {url}:\n{str(e)}")
-            raise e
+                return operation(*args, **kwargs)
+            except (TimeoutException, WebDriverException) as e:
+                last_exception = e
+                self.logger.warning(f"Operation attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(self.RETRY_DELAY * (attempt + 1))
+            except Exception as e:
+                last_exception = e
+                self.logger.error(f"Operation failed: {str(e)}")
+                raise e
+        
+        self.last_error = str(last_exception)
+        self.logger.error(f"Operation failed after {max_retries} attempts: {self.last_error}")
+        return None
+
+    def _handle_page_loading_error(self, url: str, error: Exception) -> bool:
+        """Handle page loading errors with specific recovery strategies."""
+        error_msg = str(error).lower()
+        
+        if "timeout" in error_msg:
+            self.logger.warning(f"Page load timeout for {url}, attempting simplified load")
+            try:
+                self.driver.set_page_load_timeout(5)
+                return True
+            except:
+                pass
+        elif "net::" in error_msg:
+            self.logger.warning(f"Network error for {url}: {error_msg}")
+        elif "connection" in error_msg:
+            self.logger.warning(f"Connection issue for {url}")
+        
+        return False
+
+    def go_to(self, url:str) -> bool:
+        """Navigate to a specified URL with timeout handling and retries."""
+        time.sleep(random.uniform(0.4, 2.5))
+        
+        self.logger.debug(f"[DEBUG] Starting navigation to {url}")
+        self.navigation_retries += 1
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self.logger.debug(f"[DEBUG] Navigation attempt {attempt + 1}/{self.MAX_RETRIES}")
+                
+                initial_handles = self.driver.window_handles
+                self.driver.set_page_load_timeout(self.page_timeout)
+                self.driver.get(url)
+                
+                time.sleep(random.uniform(0.01, 0.3))
+                self.logger.debug(f"[DEBUG] Page loaded, checking for blocks")
+                
+                try:
+                    wait = WebDriverWait(self.driver, timeout=self.page_timeout)
+                    wait.until(
+                        lambda driver: (
+                            not any(keyword in driver.page_source.lower() for keyword in ["checking your browser", "captcha", "cf-robot", "checking your browser before accessing"])
+                        ),
+                        message="stuck on verification screen"
+                    )
+                    self.logger.debug(f"[DEBUG] Verification passed")
+                except TimeoutException:
+                    self.logger.warning(f"Timeout waiting for verification bypass on attempt {attempt + 1}")
+                    if attempt < self.MAX_RETRIES - 1:
+                        time.sleep(self.RETRY_DELAY)
+                        continue
+                
+                self.apply_web_safety()
+                self.handle_popups_and_modals()
+                time.sleep(random.uniform(0.01, 0.2))
+                self.human_scroll()
+                
+                self.logger.info(f"Successfully navigated to: {url} (attempt {attempt + 1})")
+                self.navigation_retries = 0
+                self.last_error = None
+                return True
+                
+            except TimeoutException as e:
+                self.logger.warning(f"Timeout on attempt {attempt + 1} for {url}: {str(e)}")
+                self.last_error = str(e)
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.RETRY_DELAY)
+                    
+            except WebDriverException as e:
+                self.logger.warning(f"WebDriver error on attempt {attempt + 1} for {url}: {str(e)}")
+                self.last_error = str(e)
+                self._handle_page_loading_error(url, e)
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.RETRY_DELAY)
+                    
+            except Exception as e:
+                self.logger.error(f"Fatal error navigating to {url}: {str(e)}")
+                self.last_error = str(e)
+                raise e
+        
+        self.logger.error(f"Failed to navigate to {url} after {self.MAX_RETRIES} attempts")
+        return False
 
     def is_sentence(self, text:str) -> bool:
         """Check if the text qualifies as a meaningful sentence or contains important error codes."""
@@ -290,35 +371,40 @@ class Browser:
         is_long_enough = word_count > 4
         return (word_count >= 5 and (has_punctuation or is_long_enough))
 
-    def get_text(self) -> str | None:
-        """Get page text as formatted Markdown"""
-        try:
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            for element in soup(['script', 'style', 'noscript', 'meta', 'link']):
-                element.decompose()
-            markdown_converter = markdownify.MarkdownConverter(
-                heading_style="ATX",
-                strip=['a'],
-                autolinks=False,
-                bullets='•',
-                strong_em_symbol='*',
-                default_title=False,
-            )
-            markdown_text = markdown_converter.convert(str(soup.body))
-            lines = []
-            for line in markdown_text.splitlines():
-                stripped = line.strip()
-                if stripped and self.is_sentence(stripped):
-                    cleaned = ' '.join(stripped.split())
-                    lines.append(cleaned)
-            result = "[Start of page]\n\n" + "\n\n".join(lines) + "\n\n[End of page]"
-            result = re.sub(r'!\[(.*?)\]\(.*?\)', r'[IMAGE: \1]', result)
-            self.logger.info(f"Extracted text: {result[:100]}...")
-            self.logger.info(f"Extracted text length: {len(result)}")
-            return result[:32768]
-        except Exception as e:
-            self.logger.error(f"Error getting text: {str(e)}")
-            return None
+    def get_text(self, max_retries: int = 3) -> str | None:
+        """Get page text as formatted Markdown with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                for element in soup(['script', 'style', 'noscript', 'meta', 'link']):
+                    element.decompose()
+                markdown_converter = markdownify.MarkdownConverter(
+                    heading_style="ATX",
+                    strip=['a'],
+                    autolinks=False,
+                    bullets='•',
+                    strong_em_symbol='*',
+                    default_title=False,
+                )
+                markdown_text = markdown_converter.convert(str(soup.body))
+                lines = []
+                for line in markdown_text.splitlines():
+                    stripped = line.strip()
+                    if stripped and self.is_sentence(stripped):
+                        cleaned = ' '.join(stripped.split())
+                        lines.append(cleaned)
+                result = "[Start of page]\n\n" + "\n\n".join(lines) + "\n\n[End of page]"
+                result = re.sub(r'!\[(.*?)\]\(.*?\)', r'[IMAGE: \1]', result)
+                self.logger.info(f"Extracted text: {result[:100]}...")
+                self.logger.info(f"Extracted text length: {len(result)}")
+                return result[:32768]
+            except Exception as e:
+                self.logger.warning(f"Error getting text (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    self.logger.error(f"Failed to get text after {max_retries} attempts")
+                    return None
     
     def clean_url(self, url:str) -> str:
         """Clean URL to keep only the part needed for navigation to the page"""
@@ -683,6 +769,64 @@ class Browser:
         finally:
             self.driver.execute_script(f"document.body.style.zoom='1'")
         return True
+
+    def handle_popups_and_modals(self) -> bool:
+        """
+        Detect and handle common popups, modals, and overlay elements.
+        Returns True if a popup/modal was handled, False otherwise.
+        """
+        popup_handled = False
+        self.logger.debug("[DEBUG] Checking for popups/modals")
+        
+        popup_selectors = [
+            ("button[aria-label='Close']", "close button"),
+            ("button[class*='close']", "close button"),
+            ("div[class*='modal'] button", "modal close button"),
+            ("div[class*='popup'] button", "popup close button"),
+            ("div[class*='overlay']", "overlay"),
+            ("a[class*='close']", "anchor close"),
+            ("button[class*='dismiss']", "dismiss button"),
+            ("button[type='button']", "type button"),
+        ]
+        
+        try:
+            for selector, description in popup_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for elem in elements:
+                        if elem.is_displayed() and elem.is_enabled():
+                            text = elem.text.lower().strip()
+                            close_keywords = ['close', 'x', 'ok', 'accept', 'agree', 'cancel', 'no thanks', 'dismiss', 'later']
+                            if any(kw in text for kw in close_keywords) or description in ['close button', 'dismiss button']:
+                                self.logger.info(f"Closing {description}")
+                                elem.click()
+                                time.sleep(0.5)
+                                popup_handled = True
+                                break
+                except Exception as e:
+                    self.logger.debug(f"Error checking popup selector '{selector}': {str(e)}")
+                if popup_handled:
+                    break
+            
+            if not popup_handled:
+                try:
+                    alerts = self.driver.switch_to.alert
+                    if alerts:
+                        self.logger.info("Dismissing alert")
+                        alerts.dismiss()
+                        popup_handled = True
+                except:
+                    pass
+                    
+        except Exception as e:
+            self.logger.warning(f"Error handling popups/modals: {str(e)}")
+        
+        if popup_handled:
+            self.logger.info("Popup/modal handled successfully")
+        else:
+            self.logger.debug("[DEBUG] No popups/modals detected")
+        
+        return popup_handled
 
     def apply_web_safety(self):
         """
